@@ -40,6 +40,97 @@ var (
  ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝╚══════╝╚═╝`
 )
 
+// ------- Configuration System -------
+
+type Config struct {
+	Player   string
+	Keywords string
+}
+
+var (
+	AppConfig  Config
+	ConfigPath string
+)
+
+func initConfig() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exeDir := filepath.Dir(exePath)
+	localConf := filepath.Join(exeDir, "anicli.conf")
+
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		configDir = exeDir
+	}
+	globalConfDir := filepath.Join(configDir, "anicli")
+	globalConf := filepath.Join(globalConfDir, "anicli.conf")
+
+	// 1. Prefer local config if it exists
+	if _, err := os.Stat(localConf); err == nil {
+		ConfigPath = localConf
+		return readConfig(localConf)
+	}
+
+	// 2. Fallback to global config if it exists
+	if _, err := os.Stat(globalConf); err == nil {
+		ConfigPath = globalConf
+		return readConfig(globalConf)
+	}
+
+	// 3. Generate global config if neither exists
+	os.MkdirAll(globalConfDir, 0755)
+	defaultConf := "player=mpv\nkeywords=erai web-dl -480p -720p\n"
+	if err := os.WriteFile(globalConf, []byte(defaultConf), 0644); err != nil {
+		return err
+	}
+	ConfigPath = globalConf
+
+	// The app strictly reads values from the config file, ignoring code-level defaults
+	return readConfig(globalConf)
+}
+
+func readConfig(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	// Reset config before parsing to handle reload safely
+	AppConfig = Config{}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "player=") {
+			val := strings.TrimPrefix(line, "player=")
+			val = strings.TrimSpace(val)
+			// Strip quotes if user wrapped the path
+			AppConfig.Player = strings.Trim(val, `"'`)
+		} else if strings.HasPrefix(line, "keywords=") {
+			val := strings.TrimPrefix(line, "keywords=")
+			AppConfig.Keywords = strings.TrimSpace(val)
+		}
+	}
+	return nil
+}
+
+func openEditor(filePath string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", "", filePath)
+	case "darwin":
+		cmd = exec.Command("open", filePath)
+	default:
+		cmd = exec.Command("xdg-open", filePath)
+	}
+	if cmd != nil {
+		cmd.Start()
+	}
+}
+
 // ------- RSS Parsing -------
 
 type rssFeed struct {
@@ -61,10 +152,16 @@ type rssItem struct {
 const nyaaBaseURL = "https://nyaa.si"
 
 func nyaaRSSURL(query string) string {
-	if query == "" {
-		return fmt.Sprintf("%s/?page=rss", nyaaBaseURL)
+	fullQuery := query
+	if AppConfig.Keywords != "" {
+		fullQuery += " " + AppConfig.Keywords
 	}
-	return fmt.Sprintf("%s/?page=rss&q=%s", nyaaBaseURL, url.QueryEscape(query))
+	fullQuery = strings.TrimSpace(fullQuery)
+
+	if fullQuery == "" {
+		return fmt.Sprintf("%s/?page=rss&c=0_0&f=0", nyaaBaseURL)
+	}
+	return fmt.Sprintf("%s/?page=rss&q=%s&c=0_0&f=0", nyaaBaseURL, url.QueryEscape(fullQuery))
 }
 
 func fetchRSS(url string) (string, error) {
@@ -175,6 +272,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "ctrl+s":
+			// Open config file securely in system's native editor
+			openEditor(ConfigPath)
+			return m, nil
 		case "esc":
 			if m.state == stateChoosing {
 				m.state = stateSearch
@@ -187,6 +288,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSearch && m.textInput.Value() != "" {
 				m.state = stateFetching
 				m.err = nil
+
+				// Automatically re-read config prior to search (applies on-the-fly config edits)
+				_ = readConfig(ConfigPath)
+
 				return m, tea.Batch(m.spinner.Tick, fetchTorrentsCmd(m.textInput.Value()))
 			}
 			if m.state == stateChoosing {
@@ -247,7 +352,7 @@ func (m model) View() string {
 		if m.err != nil {
 			content += "\n\n" + errorStyle.Render(fmt.Sprintf("❌ Error: %v", m.err))
 		}
-		content += "\n\n(ESC to quit, ENTER to search)"
+		content += "\n\n(ESC to quit, ENTER to search, CTRL+S to edit settings)"
 	case stateFetching:
 		content = fmt.Sprintf("%s Searching Nyaa.si for '%s'...", m.spinner.View(), m.textInput.Value())
 	case stateChoosing:
@@ -312,22 +417,17 @@ func downloadTorrentFile(url, destPath string) error {
 }
 
 func openPlayer(streamURL string) {
-	var cmd *exec.Cmd
-
-	switch runtime.GOOS {
-	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", "", streamURL)
-	case "darwin":
-		cmd = exec.Command("open", streamURL)
-	default:
-		cmd = exec.Command("xdg-open", streamURL)
+	player := AppConfig.Player
+	if player == "" {
+		player = "mpv" // Fallback if manually wiped in config
 	}
 
-	if cmd != nil {
-		if err := cmd.Start(); err != nil {
-			log.Printf("❌ Failed to start default player: %v", err)
-			fmt.Printf("Please open this stream URL manually in your player:\n%s\n", streamURL)
-		}
+	// Automatically executes exact path provided in the config file
+	cmd := exec.Command(player, streamURL)
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("❌ Failed to start player '%s': %v", player, err)
+		fmt.Printf("Please open this stream URL manually in your player:\n%s\n", streamURL)
 	}
 }
 
@@ -348,7 +448,6 @@ func streamTorrent(item *rssItem) error {
 	}
 	defer client.Close()
 
-	// The Link extracted from the RSS item is ALREADY the exact download URL
 	torrentURL := item.Link
 	if torrentURL == "" {
 		return fmt.Errorf("could not determine the .torrent download URL from link")
@@ -389,7 +488,6 @@ func streamTorrent(item *rssItem) error {
 		return fmt.Errorf("no playable video file found in the torrent")
 	}
 
-	// High priority for our target file
 	targetFile.SetPriority(torrent.PiecePriorityHigh)
 
 	firstPiece := targetFile.BeginPieceIndex()
@@ -466,10 +564,14 @@ func streamTorrent(item *rssItem) error {
 // ------- Application Root Loop -------
 
 func main() {
+	if err := initConfig(); err != nil {
+		fmt.Printf("Warning: Unable to process configuration files properly: %v\n", err)
+	}
+
 	for {
 		m := initialModel()
 
-		// Run TUI in Alternate Screen to not clutter terminal history during search
+		// Run TUI in Alternate Screen
 		p := tea.NewProgram(m, tea.WithAltScreen())
 
 		fm, err := p.Run()
@@ -484,7 +586,6 @@ func main() {
 		}
 
 		if finalModel.selected != nil {
-			// Back in normal terminal screen:
 			fmt.Printf("\n🎬 Readying video stream for: \x1b[38;5;45m%s\x1b[0m\n\n", finalModel.selected.Title)
 
 			if err := streamTorrent(finalModel.selected); err != nil {
