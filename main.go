@@ -235,7 +235,7 @@ func (m model) View() string {
 	}
 
 	header := titleStyle.Render(banner) + "\n" +
-		subStyle.Render("⚡ Nyaa.si Streamer & Fast Downloader | Version 2.0") + "\n\n"
+		subStyle.Render("⚡Watch Nyaa.si torrents from your terminal") + "\n\n"
 
 	var content string
 	switch m.state {
