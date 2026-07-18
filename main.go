@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -17,7 +16,28 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent"
-	"github.com/manifoldco/promptui"
+	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ------- Styles & UI -------
+
+var (
+	appStyle   = lipgloss.NewStyle().Padding(1, 2)
+	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Bold(true)
+	subStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+
+	banner = `
+  █████╗ ███╗   ██╗██╗ ██████╗██╗     ██╗
+ ██╔══██╗████╗  ██║██║██╔════╝██║     ██║
+ ███████║██╔██╗ ██║██║██║     ██║     ██║
+ ██╔══██║██║╚██╗██║██║██║     ██║     ██║
+ ██║  ██║██║ ╚████║██║╚██████╗███████╗██║
+ ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝╚══════╝╚═╝`
 )
 
 // ------- RSS Parsing -------
@@ -78,6 +98,181 @@ func parseItems(xmlData string) ([]rssItem, error) {
 	return feed.Channel.Items, nil
 }
 
+// ------- Bubble Tea TUI Model -------
+
+type sessionState int
+
+const (
+	stateSearch sessionState = iota
+	stateFetching
+	stateChoosing
+)
+
+type listItem struct {
+	rssItem
+}
+
+// list.Item interface implementation
+func (i listItem) Title() string { return i.rssItem.Title }
+func (i listItem) Description() string {
+	return fmt.Sprintf("📦 Size: %s | 🌱 Seeders: %s", i.rssItem.Size, i.rssItem.Seeders)
+}
+func (i listItem) FilterValue() string { return i.rssItem.Title }
+
+type rssResultMsg []rssItem
+type errMsg struct{ err error }
+
+func (e errMsg) Error() string { return e.err.Error() }
+
+type model struct {
+	state     sessionState
+	textInput textinput.Model
+	spinner   spinner.Model
+	list      list.Model
+	selected  *rssItem
+	err       error
+	quitting  bool
+}
+
+func initialModel() model {
+	ti := textinput.New()
+	ti.Placeholder = "e.g. 'Jujutsu Kaisen 1080p'"
+	ti.Focus()
+	ti.CharLimit = 156
+	ti.Width = 50
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+
+	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "Select Episode"
+	l.SetShowStatusBar(true)
+	l.Styles.Title = lipgloss.NewStyle().Background(lipgloss.Color("45")).Foreground(lipgloss.Color("0")).Padding(0, 1)
+
+	return model{
+		state:     stateSearch,
+		textInput: ti,
+		spinner:   sp,
+		list:      l,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return textinput.Blink
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "esc":
+			if m.state == stateChoosing {
+				m.state = stateSearch
+				m.list.ResetSelected()
+				return m, nil
+			}
+			m.quitting = true
+			return m, tea.Quit
+		case "enter":
+			if m.state == stateSearch && m.textInput.Value() != "" {
+				m.state = stateFetching
+				m.err = nil
+				return m, tea.Batch(m.spinner.Tick, fetchTorrentsCmd(m.textInput.Value()))
+			}
+			if m.state == stateChoosing {
+				if i, ok := m.list.SelectedItem().(listItem); ok {
+					m.selected = &i.rssItem
+					return m, tea.Quit
+				}
+			}
+		}
+
+	case tea.WindowSizeMsg:
+		h, v := appStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
+		m.textInput.Width = msg.Width - h - 4
+
+	case rssResultMsg:
+		items := make([]list.Item, len(msg))
+		for i, res := range msg {
+			items[i] = listItem{rssItem: res}
+		}
+		m.list.SetItems(items)
+		m.state = stateChoosing
+		return m, nil
+
+	case errMsg:
+		m.err = msg.err
+		m.state = stateSearch
+		return m, nil
+	}
+
+	switch m.state {
+	case stateSearch:
+		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+	case stateFetching:
+		m.spinner, cmd = m.spinner.Update(msg)
+		cmds = append(cmds, cmd)
+	case stateChoosing:
+		m.list, cmd = m.list.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+func (m model) View() string {
+	if m.quitting && m.selected == nil {
+		return ""
+	}
+
+	header := titleStyle.Render(banner) + "\n" +
+		subStyle.Render("⚡ Nyaa.si Streamer & Fast Downloader | Version 2.0") + "\n\n"
+
+	var content string
+	switch m.state {
+	case stateSearch:
+		content = "🔍 Search Anime:\n\n" + m.textInput.View()
+		if m.err != nil {
+			content += "\n\n" + errorStyle.Render(fmt.Sprintf("❌ Error: %v", m.err))
+		}
+		content += "\n\n(ESC to quit, ENTER to search)"
+	case stateFetching:
+		content = fmt.Sprintf("%s Searching Nyaa.si for '%s'...", m.spinner.View(), m.textInput.Value())
+	case stateChoosing:
+		// Full screen view for the list
+		return appStyle.Render(m.list.View())
+	}
+
+	return appStyle.Render(header + content)
+}
+
+func fetchTorrentsCmd(query string) tea.Cmd {
+	return func() tea.Msg {
+		rssURL := nyaaRSSURL(query)
+		data, err := fetchRSS(rssURL)
+		if err != nil {
+			return errMsg{fmt.Errorf("failed to fetch: %w", err)}
+		}
+		items, err := parseItems(data)
+		if err != nil {
+			return errMsg{fmt.Errorf("failed to parse: %w", err)}
+		}
+		if len(items) == 0 {
+			return errMsg{fmt.Errorf("no results found")}
+		}
+		return rssResultMsg(items)
+	}
+}
+
 // ------- Torrent Streaming via anacrolix/torrent -------
 
 var videoExts = map[string]bool{
@@ -127,7 +322,6 @@ func buildMagnet(infoHash string) string {
 	return fmt.Sprintf("magnet:?xt=urn:btih:%s", strings.ToLower(infoHash))
 }
 
-// Open the local video file using the OS default application.
 func openPlayer(streamURL string) {
 	var cmd *exec.Cmd
 
@@ -197,10 +391,10 @@ func streamTorrent(item *rssItem) error {
 	case <-t.GotInfo():
 		fmt.Println(" done!")
 	case <-time.After(25 * time.Second):
-		return fmt.Errorf("timed out waiting for torrent metadata. Seeders might be offline.")
+		return fmt.Errorf("timed out waiting for torrent metadata. Seeders might be offline")
 	}
 
-	// Pick the largest video file
+	// Pick largest file
 	var targetFile *torrent.File
 	for _, f := range t.Files() {
 		ext := strings.ToLower(filepath.Ext(f.Path()))
@@ -214,8 +408,7 @@ func streamTorrent(item *rssItem) error {
 		return fmt.Errorf("no playable video file found in the torrent")
 	}
 
-	// OPTIMIZATION 1: First & Last Piece Prioritization
-	// This lets players like mpv fetch the file index headers immediately without waiting.
+	// OPTIMIZATION 1
 	targetFile.SetPriority(torrent.PiecePriorityHigh)
 
 	firstPiece := targetFile.BeginPieceIndex()
@@ -232,8 +425,7 @@ func streamTorrent(item *rssItem) error {
 	t.DownloadAll()
 	t.DisallowDataUpload()
 
-	// OPTIMIZATION 2: Reduced buffering threshold
-	// Decreased waiting threshold from 10MB to 1.5MB to initiate playback in under 3-5 seconds!
+	// OPTIMIZATION 2
 	fmt.Print("🚀 Fast-buffering essential playback indexes")
 	deadline := time.Now().Add(45 * time.Second)
 	buffered := false
@@ -281,7 +473,6 @@ func streamTorrent(item *rssItem) error {
 	streamURL := fmt.Sprintf("http://127.0.0.1:%d/%s", port, videoName)
 	fmt.Printf("🌍 Streaming Server: %s\n", streamURL)
 
-	// Open stream in the OS default player.
 	openPlayer(streamURL)
 
 	fmt.Println("\nPress [Enter] to terminate stream and clean up cache files...")
@@ -292,113 +483,34 @@ func streamTorrent(item *rssItem) error {
 	return nil
 }
 
-// ------- Main CLI with Arrow-key Navigation -------
+// ------- Application Root Loop -------
 
 func main() {
-	reader := bufio.NewReader(os.Stdin)
-
-	// Cyberpunk-style Header
-	fmt.Println("\x1b[38;5;45m" + `
-  █████╗ ███╗   ██╗██╗ ██████╗██╗     ██╗
- ██╔══██╗████╗  ██║██║██╔════╝██║     ██║
- ███████║██╔██╗ ██║██║██║     ██║     ██║
- ██╔══██║██║╚██╗██║██║██║     ██║     ██║
- ██║  ██║██║ ╚████║██║╚██████╗███████╗██║
- ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝ ╚═════╝╚══════╝╚═╝` + "\x1b[0m")
-	fmt.Println("\x1b[90m⚡ Nyaa.si Streamer & Fast Downloader | Version 2.0\x1b[0m\n")
-
-	// No player detection is required; the OS default video player will be used.
-
 	for {
-		fmt.Print("\n🔍 Search Anime (or press Enter on 'exit' to quit): ")
-		query, _ := reader.ReadString('\n')
-		query = strings.TrimSpace(query)
+		m := initialModel()
 
-		if query == "exit" || query == "quit" {
+		// Run TUI in Alternate Screen to not clutter terminal history during search
+		p := tea.NewProgram(m, tea.WithAltScreen())
+
+		fm, err := p.Run()
+		if err != nil {
+			fmt.Printf("Error starting CLI interface: %v\n", err)
+			os.Exit(1)
+		}
+
+		finalModel, ok := fm.(model)
+		if !ok || (finalModel.quitting && finalModel.selected == nil) {
 			break
 		}
-		if query == "" {
-			continue
-		}
 
-		fmt.Printf("📡 Searching Nyaa.si for \"%s\"...\n", query)
-		rssURL := nyaaRSSURL(query)
-		rssData, err := fetchRSS(rssURL)
-		if err != nil {
-			fmt.Printf("❌ Failed to query Nyaa: %v\n", err)
-			continue
-		}
+		if finalModel.selected != nil {
+			// Back in normal terminal screen:
+			fmt.Printf("\n🎬 Readying video stream for: \x1b[38;5;45m%s\x1b[0m\n\n", finalModel.selected.Title)
 
-		items, err := parseItems(rssData)
-		if err != nil {
-			fmt.Printf("❌ Failed to parse XML output: %v\n", err)
-			continue
-		}
-
-		if len(items) == 0 {
-			fmt.Println("⚠️  No episodes match this query. Try adding keywords (e.g., '1080p' or sub group)!")
-			continue
-		}
-
-		// List of options to navigate
-		var options []string
-		for _, item := range items {
-			sizeInfo := ""
-			if item.Size != "" {
-				sizeInfo = fmt.Sprintf(" [%s]", item.Size)
+			if err := streamTorrent(finalModel.selected); err != nil {
+				fmt.Printf("❌ Stream closed with error: %v\n", err)
+				time.Sleep(2 * time.Second)
 			}
-			options = append(options, fmt.Sprintf("%s%s", item.Title, sizeInfo))
-		}
-		options = append(options, "🔄 [Go Back / Search Again]")
-
-		// Setup promptui Selector
-		// Use plain templates on Windows to avoid readline ANSI handling bugs.
-		templates := &promptui.SelectTemplates{
-			Label:    "{{ . }}",
-			Active:   "▶️ {{ . }}",
-			Inactive: "   {{ . }}",
-			Selected: "🍿 Selected: {{ . }}",
-		}
-
-		// On non-Windows platforms keep the colored templates for nicer UI
-		if runtime.GOOS != "windows" {
-			templates = &promptui.SelectTemplates{
-				Label:    "{{ . }}",
-				Active:   "▶️ \x1b[38;5;45m{{ . | cyan }}\x1b[0m",
-				Inactive: "   {{ . }}",
-				Selected: "🍿 Selected: \x1b[38;5;118m{{ . | green }}\x1b[0m",
-			}
-		}
-
-		prompt := promptui.Select{
-			Label:     "Select an episode using Arrow Keys (↑/↓) and press Enter:",
-			Items:     options,
-			Templates: templates,
-			Size:      12,
-		}
-
-		idx, _, err := prompt.Run()
-		if err != nil {
-			fmt.Println("❌ Selection aborted.")
-			continue
-		}
-
-		// Defensive: ensure idx is within bounds. The options slice includes
-		// an extra "Go Back" entry, which is at index len(items).
-		if idx < 0 || idx > len(items) {
-			fmt.Println("❌ Invalid selection index, please try again.")
-			continue
-		}
-
-		if idx == len(items) { // Go Back / Search Again
-			continue
-		}
-
-		selected := &items[idx]
-		fmt.Printf("\n🎬 Readying video stream for: %s\n", selected.Title)
-
-		if err := streamTorrent(selected); err != nil {
-			fmt.Printf("❌ Stream closed with error: %v\n", err)
 		}
 	}
 
