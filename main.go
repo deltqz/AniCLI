@@ -513,6 +513,4 @@ func main() {
 			}
 		}
 	}
-
-	fmt.Println("\n\x1b[38;5;118mArigatou gozaimasu! Sayonara! 🌸\x1b[0m")
 }
