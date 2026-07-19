@@ -10,12 +10,18 @@ Extract `anicli.exe` to any folder and manually add it to PATH.
 
 ### Linux
 ```sh
-tar -xf anicli-linux-x64.tar.xz
-sudo install -m 755 anicli/anicli /usr/local/bin/
+curl -LO https://github.com/deltqz/AniCLI/releases/latest/download/anicli-linux-x64.tar.gz
+tar -xzf anicli-linux-x64.tar.gz && rm -rf anicli-linux-x64.tar.gz
+sudo install -m 755 anicli/anicli /usr/local/bin/ && rm -rf anicli
 ```
 
 ### macOS
-Same as Linux, but you may want to remove the quarantine attribute right after.
+Brew recipe? Maybe one day.
 ```sh
+curl -L https://github.com/deltqz/AniCLI/releases/latest/download/anicli-mac-arm64.zip
+unzip anicli-mac-arm64.zip && rm -rf anicli-mac-arm64.zip
+sudo install -m 755 anicli/anicli /usr/local/bin/ && rm -rf anicli
 sudo xattr -d com.apple.quarantine /usr/local/bin/anicli
 ```
+
+curl -L https://github.com/deltqz/AniCLI/releases/latest/download/anicli-linux-x64.tar.gz | tar -xzf -
